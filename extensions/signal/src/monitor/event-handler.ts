@@ -512,6 +512,7 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     }
 
     const dataMessage = envelope.dataMessage ?? envelope.editMessage?.dataMessage;
+
     const reaction = deps.isSignalReactionMessage(envelope.reactionMessage)
       ? envelope.reactionMessage
       : deps.isSignalReactionMessage(dataMessage?.reaction)
@@ -555,20 +556,14 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
         .targetSentTimestamp;
       logVerbose(`signal: bare reaction (${emojiLabel}) from ${senderDisplayBare}`);
       if (!isRemove) {
-        // P2: per-field fallback so a present-but-empty reaction.groupInfo doesn't shadow
-        // a populated dataMessage.groupInfo (e.g. Signal emits groupInfo={} on the reaction
-        // envelope while the real groupId/groupName live on dataMessage.groupInfo).
-        const bareReactionGroupInfo = bareReaction as {
-          groupInfo?: { groupId?: string; groupName?: string } | null;
-        };
-        const groupId =
-          bareReactionGroupInfo.groupInfo?.groupId ?? dataMessage?.groupInfo?.groupId ?? undefined;
-        const groupName =
-          bareReactionGroupInfo.groupInfo?.groupName ??
-          dataMessage?.groupInfo?.groupName ??
-          undefined;
+        // P2: prefer group info from the reaction payload itself; fall back to dataMessage.groupInfo.
+        const bareReactionGroupInfo =
+          (bareReaction as { groupInfo?: { groupId?: string; groupName?: string } | null })
+            .groupInfo ?? dataMessage?.groupInfo;
+        const groupId = bareReactionGroupInfo?.groupId ?? undefined;
+        const groupName = bareReactionGroupInfo?.groupName ?? undefined;
         const isGroup = Boolean(groupId);
-        // Apply full access policy (dmPolicy/groupPolicy/pairing) — same as handleReactionOnlyInbound.
+        // Apply full access policy (dmPolicy/groupPolicy) — same as handleReactionOnlyInbound.
         const bareAccessDecision = resolveAccessDecision(isGroup);
         if (bareAccessDecision.decision !== "allow") {
           logVerbose(
@@ -657,21 +652,6 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     const groupId = dataMessage.groupInfo?.groupId ?? undefined;
     const groupName = dataMessage.groupInfo?.groupName ?? undefined;
     const isGroup = Boolean(groupId);
-
-    // Skip signal-cli system messages that have no user-visible content
-    const isTimerUpdate =
-      !messageText &&
-      !quoteText &&
-      !dataMessage.attachments?.length &&
-      (dataMessage.isExpirationUpdate === true ||
-        (typeof dataMessage.expiresInSeconds === "number" && dataMessage.expiresInSeconds > 0));
-    const isGroupV2Change = Boolean(dataMessage.groupV2Change);
-    if (isTimerUpdate || isGroupV2Change) {
-      logVerbose(
-        `signal: skipping system message (isTimerUpdate=${isTimerUpdate}, isGroupV2Change=${isGroupV2Change})`,
-      );
-      return;
-    }
 
     if (!isGroup) {
       const allowedDirectMessage = await handleSignalDirectMessageAccess({
@@ -881,17 +861,15 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     if (mediaPaths.length > 1) {
       placeholder = formatAttachmentSummaryPlaceholder(mediaTypes);
     } else {
+      // Only set placeholder when we actually resolved a mediaType.
+      // Guard against undefined kind (e.g. blank reaction envelopes) so null-body
+      // messages aren't dispatched with a spurious <media:…> body.
       const kind = mediaType ? kindFromMime(mediaType) : undefined;
       if (kind) {
         placeholder = `<media:${kind}>`;
-      } else if (mediaPath || attachments.length) {
-        // A path was resolved (real attachment, unrecognised MIME), fetch
-        // returned null, or we are intentionally skipping fetching — preserve
-        // the attachment placeholder so the message is not silently lost.
+      } else if (dataMessage.attachments?.length) {
         placeholder = "<media:attachment>";
       }
-      // No attachments at all (blank reaction envelope):
-      // Leave placeholder empty; the !bodyText guard below will drop it silently.
     }
 
     const bodyText = messageText || placeholder || dataMessage.quote?.text?.trim() || "";
