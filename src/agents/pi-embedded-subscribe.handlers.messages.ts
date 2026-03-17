@@ -17,6 +17,7 @@ import {
   formatReasoningMessage,
   promoteThinkingTagsToBlocks,
 } from "./pi-embedded-utils.js";
+import { logTokenUsage } from "./token-usage-logger.js";
 
 const stripTrailingDirective = (text: string): string => {
   const openIndex = text.lastIndexOf("[[");
@@ -264,6 +265,27 @@ export function handleMessageEnd(
   const assistantMessage = msg;
   ctx.noteLastAssistant(assistantMessage);
   ctx.recordAssistantUsage((assistantMessage as { usage?: unknown }).usage);
+  const _usageLike = (
+    assistantMessage as {
+      usage?: {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        model?: string;
+      };
+    }
+  ).usage;
+  if (_usageLike) {
+    logTokenUsage({
+      sessionKey: ctx.params.sessionKey,
+      model: (assistantMessage as { model?: string }).model,
+      inputTokens: _usageLike.input ?? 0,
+      outputTokens: _usageLike.output ?? 0,
+      cacheReadTokens: _usageLike.cacheRead ?? 0,
+      cacheCreationTokens: _usageLike.cacheWrite ?? 0,
+    });
+  }
   if (ctx.state.deterministicApprovalPromptSent) {
     return;
   }
