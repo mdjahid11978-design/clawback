@@ -734,16 +734,8 @@ export function formatAssistantErrorText(
     );
   }
 
-  // Catch Anthropic thinking blocks error specifically
-  if (
-    raw.includes("thinking") &&
-    raw.includes("redacted_thinking") &&
-    raw.includes("cannot be modified")
-  ) {
-    return (
-      "Context compaction encountered an issue with Anthropic's thinking blocks. " +
-      "Try running /compact again, or use /new to start a fresh session."
-    );
+  if (isThinkingBlockImmutabilityError(raw)) {
+    return "Session history conflict (thinking block mismatch). Use /new to start a fresh session.";
   }
 
   const invalidRequest = raw.match(/"type":"invalid_request_error".*?"message":"([^"]+)"/);
@@ -851,6 +843,13 @@ export function isMissingToolCallInputError(raw: string): boolean {
     return false;
   }
   return TOOL_CALL_INPUT_MISSING_RE.test(raw) || TOOL_CALL_INPUT_PATH_RE.test(raw);
+}
+
+export function isThinkingBlockImmutabilityError(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  return /thinking.*blocks?.*cannot.*modified/i.test(raw);
 }
 
 export function isBillingAssistantError(msg: AssistantMessage | undefined): boolean {
