@@ -97,6 +97,7 @@ export function isContextOverflowError(errorMessage?: string): boolean {
     lower.includes("context length exceeded") ||
     lower.includes("maximum context length") ||
     lower.includes("prompt is too long") ||
+    lower.includes("prompt too long") ||
     lower.includes("exceeds model context window") ||
     lower.includes("model token limit") ||
     (hasRequestSizeExceeds && hasContextWindow) ||
@@ -211,11 +212,12 @@ export function extractObservedOverflowTokenCount(errorMessage?: string): number
   return undefined;
 }
 
+// Allow provider-wrapped API payloads such as "Ollama API error 400: {...}".
 const ERROR_PAYLOAD_PREFIX_RE =
-  /^(?:error|api\s*error|apierror|openai\s*error|anthropic\s*error|gateway\s*error)[:\s-]+/i;
+  /^(?:error|(?:[a-z][\w-]*\s+)?api\s*error|apierror|openai\s*error|anthropic\s*error|gateway\s*error)(?:\s+\d{3})?[:\s-]+/i;
 const FINAL_TAG_RE = /<\s*\/?\s*final\s*>/gi;
 const ERROR_PREFIX_RE =
-  /^(?:error|api\s*error|openai\s*error|anthropic\s*error|gateway\s*error|request failed|failed|exception)[:\s-]+/i;
+  /^(?:error|(?:[a-z][\w-]*\s+)?api\s*error|openai\s*error|anthropic\s*error|gateway\s*error|request failed|failed|exception)(?:\s+\d{3})?[:\s-]+/i;
 const CONTEXT_OVERFLOW_ERROR_HEAD_RE =
   /^(?:context overflow:|request_too_large\b|request size exceeds\b|request exceeds the maximum size\b|context length exceeded\b|maximum context length\b|prompt is too long\b|exceeds model context window\b)/i;
 const HTTP_STATUS_PREFIX_RE = /^(?:http\s*)?(\d{3})\s+(.+)$/i;
@@ -729,6 +731,18 @@ export function formatAssistantErrorText(
       "Session history looks corrupted (tool call input missing). " +
       "Use /new to start a fresh session. " +
       "If this keeps happening, reset the session or delete the corrupted session transcript."
+    );
+  }
+
+  // Catch Anthropic thinking blocks error specifically
+  if (
+    raw.includes("thinking") &&
+    raw.includes("redacted_thinking") &&
+    raw.includes("cannot be modified")
+  ) {
+    return (
+      "Context compaction encountered an issue with Anthropic's thinking blocks. " +
+      "Try running /compact again, or use /new to start a fresh session."
     );
   }
 

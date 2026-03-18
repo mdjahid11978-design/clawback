@@ -19,11 +19,11 @@ import { createInternalHookEvent, triggerInternalHook } from "../../hooks/intern
 import { getMachineDisplayName } from "../../infra/machine-name.js";
 import { generateSecureToken } from "../../infra/secure-random.js";
 import { getMemorySearchManager } from "../../memory/index.js";
-import { resolveSignalReactionLevel } from "../../plugin-sdk-internal/signal.js";
+import { resolveSignalReactionLevel } from "../../plugin-sdk/signal.js";
 import {
   resolveTelegramInlineButtonsScope,
   resolveTelegramReactionLevel,
-} from "../../plugin-sdk-internal/telegram.js";
+} from "../../plugin-sdk/telegram.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { prepareProviderRuntimeAuth } from "../../plugins/provider-runtime.js";
 import { type enqueueCommand, enqueueCommandInLane } from "../../process/command-queue.js";
@@ -53,6 +53,8 @@ import { supportsModelTools } from "../model-tool-support.js";
 import { ensureOpenClawModelsJson } from "../models-config.js";
 import { createConfiguredOllamaStreamFn } from "../ollama-stream.js";
 import { resolveOwnerDisplaySetting } from "../owner-display.js";
+import { createBundleLspToolRuntime } from "../pi-bundle-lsp-runtime.js";
+import { createBundleMcpToolRuntime } from "../pi-bundle-mcp-tools.js";
 import {
   ensureSessionHeader,
   validateAnthropicTurns,
@@ -90,6 +92,7 @@ import {
 import { getDmHistoryLimitFromSessionKey, limitHistoryTurns } from "./history.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
 import { log } from "./logger.js";
+import { buildEmbeddedMessageActionDiscoveryInput } from "./message-action-discovery-input.js";
 import { buildModelAliasLines, resolveModelAsync } from "./model.js";
 import { buildEmbeddedSandboxInfo } from "./sandbox-info.js";
 import { prewarmSessionFile, trackSessionManagerAccess } from "./session-manager-cache.js";
@@ -112,6 +115,11 @@ export type CompactEmbeddedPiSessionParams = {
   messageChannel?: string;
   messageProvider?: string;
   agentAccountId?: string;
+  currentChannelId?: string;
+  currentThreadTs?: string;
+  currentMessageId?: string | number;
+  /** Trusted sender id from inbound context for scoped message-tool discovery. */
+  senderId?: string;
   authProfileId?: string;
   /** Group id for channel-level tool policy resolution. */
   groupId?: string | null;
@@ -147,6 +155,8 @@ export type CompactEmbeddedPiSessionParams = {
   extraSystemPrompt?: string;
   ownerNumbers?: string[];
   abortSignal?: AbortSignal;
+  /** Allow runtime plugins for this compaction to late-bind the gateway subagent. */
+  allowGatewaySubagentBinding?: boolean;
 };
 
 type CompactionMessageMetrics = {
@@ -231,6 +241,79 @@ function summarizeCompactionMessages(messages: AgentMessage[]): CompactionMessag
     estTokens: tokenEstimationFailed ? undefined : estTokens,
     contributors: contributors.toSorted((a, b) => b.chars - a.chars).slice(0, 3),
   };
+}
+
+/**
+ * Extract thinking and redacted_thinking blocks from the latest assistant message.
+ * Anthropic's API requires these blocks to remain unmodified in the latest assistant message.
+ */
+function extractThinkingBlocksFromLatestAssistant(
+  messages: AgentMessage[],
+): { blocks: unknown[]; messageIndex: number } | null {
+  // Find the latest assistant message
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (
+      msg &&
+      typeof msg === "object" &&
+      msg.role === "assistant" &&
+      Array.isArray((msg as { content?: unknown }).content)
+    ) {
+      const content = (msg as { content: unknown[] }).content;
+      const thinkingBlocks = content.filter(
+        (block) =>
+          block &&
+          typeof block === "object" &&
+          ((block as { type?: unknown }).type === "thinking" ||
+            (block as { type?: unknown }).type === "redacted_thinking"),
+      );
+      if (thinkingBlocks.length > 0) {
+        return { blocks: thinkingBlocks, messageIndex: i };
+      }
+      // Found latest assistant message but it has no thinking blocks
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Restore thinking blocks to the latest assistant message after compaction.
+ * This ensures Anthropic's API requirement is met.
+ */
+function restoreThinkingBlocksToLatestAssistant(
+  messages: AgentMessage[],
+  preserved: { blocks: unknown[]; messageIndex: number } | null,
+): void {
+  if (!preserved || preserved.blocks.length === 0) {
+    return;
+  }
+
+  // Find the latest assistant message after compaction
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (
+      msg &&
+      typeof msg === "object" &&
+      msg.role === "assistant" &&
+      Array.isArray((msg as { content?: unknown }).content)
+    ) {
+      const content = (msg as { content: unknown[] }).content;
+      // Remove any existing thinking blocks that may have been added during compaction
+      const nonThinkingContent = content.filter(
+        (block) =>
+          !(
+            block &&
+            typeof block === "object" &&
+            ((block as { type?: unknown }).type === "thinking" ||
+              (block as { type?: unknown }).type === "redacted_thinking")
+          ),
+      );
+      // Prepend the preserved thinking blocks (they should come first)
+      (msg as { content: unknown[] }).content = [...preserved.blocks, ...nonThinkingContent];
+      return;
+    }
+  }
 }
 
 function classifyCompactionReason(reason?: string): string {
@@ -384,6 +467,7 @@ export async function compactEmbeddedPiSessionDirect(
   ensureRuntimePluginsLoaded({
     config: params.config,
     workspaceDir: resolvedWorkspace,
+    allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
   });
   const prevCwd = process.cwd();
 
@@ -570,21 +654,46 @@ export async function compactEmbeddedPiSessionDirect(
       groupSpace: params.groupSpace,
       spawnedBy: params.spawnedBy,
       senderIsOwner: params.senderIsOwner,
+      allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
       agentDir,
       workspaceDir: effectiveWorkspace,
       config: params.config,
       abortSignal: runAbortController.signal,
       modelProvider: model.provider,
       modelId,
+      modelCompat: effectiveModel.compat,
       modelContextWindowTokens: ctxInfo.tokens,
       modelAuthMode: resolveModelAuthMode(model.provider, params.config),
     });
+    const toolsEnabled = supportsModelTools(runtimeModel);
     const tools = sanitizeToolsForGoogle({
-      tools: supportsModelTools(runtimeModel) ? toolsRaw : [],
+      tools: toolsEnabled ? toolsRaw : [],
       provider,
     });
-    const allowedToolNames = collectAllowedToolNames({ tools });
-    logToolSchemasForGoogle({ tools, provider });
+    const bundleMcpRuntime = toolsEnabled
+      ? await createBundleMcpToolRuntime({
+          workspaceDir: effectiveWorkspace,
+          cfg: params.config,
+          reservedToolNames: tools.map((tool) => tool.name),
+        })
+      : undefined;
+    const bundleLspRuntime = toolsEnabled
+      ? await createBundleLspToolRuntime({
+          workspaceDir: effectiveWorkspace,
+          cfg: params.config,
+          reservedToolNames: [
+            ...tools.map((tool) => tool.name),
+            ...(bundleMcpRuntime?.tools.map((tool) => tool.name) ?? []),
+          ],
+        })
+      : undefined;
+    const effectiveTools = [
+      ...tools,
+      ...(bundleMcpRuntime?.tools ?? []),
+      ...(bundleLspRuntime?.tools ?? []),
+    ];
+    const allowedToolNames = collectAllowedToolNames({ tools: effectiveTools });
+    logToolSchemasForGoogle({ tools: effectiveTools, provider });
     const machineName = await getMachineDisplayName();
     const runtimeChannel = normalizeMessageChannel(params.messageChannel ?? params.messageProvider);
     let runtimeCapabilities = runtimeChannel
@@ -632,12 +741,26 @@ export async function compactEmbeddedPiSessionDirect(
             return undefined;
           })()
         : undefined;
+    const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+      sessionKey: params.sessionKey,
+      config: params.config,
+    });
     // Resolve channel-specific message actions for system prompt
     const channelActions = runtimeChannel
-      ? listChannelSupportedActions({
-          cfg: params.config,
-          channel: runtimeChannel,
-        })
+      ? listChannelSupportedActions(
+          buildEmbeddedMessageActionDiscoveryInput({
+            cfg: params.config,
+            channel: runtimeChannel,
+            currentChannelId: params.currentChannelId,
+            currentThreadTs: params.currentThreadTs,
+            currentMessageId: params.currentMessageId,
+            accountId: params.agentAccountId,
+            sessionKey: params.sessionKey,
+            sessionId: params.sessionId,
+            agentId: sessionAgentId,
+            senderId: params.senderId,
+          }),
+        )
       : undefined;
     const messageToolHints = runtimeChannel
       ? resolveChannelMessageToolHints({
@@ -663,10 +786,6 @@ export async function compactEmbeddedPiSessionDirect(
     const userTimezone = resolveUserTimezone(params.config?.agents?.defaults?.userTimezone);
     const userTimeFormat = resolveUserTimeFormat(params.config?.agents?.defaults?.timeFormat);
     const userTime = formatUserTime(new Date(), userTimezone, userTimeFormat);
-    const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
-      sessionKey: params.sessionKey,
-      config: params.config,
-    });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
     const promptMode =
       isSubagentSessionKey(params.sessionKey) || isCronSessionKey(params.sessionKey)
@@ -701,7 +820,7 @@ export async function compactEmbeddedPiSessionDirect(
       reactionGuidance,
       messageToolHints,
       sandboxInfo,
-      tools,
+      tools: effectiveTools,
       modelAliasLines: buildModelAliasLines(params.config),
       userTimezone,
       userTime,
@@ -764,7 +883,7 @@ export async function compactEmbeddedPiSessionDirect(
       }
 
       const { builtInTools, customTools } = splitSdkTools({
-        tools,
+        tools: effectiveTools,
         sandboxEnabled: !!sandbox?.enabled,
       });
 
@@ -940,6 +1059,11 @@ export async function compactEmbeddedPiSessionDirect(
           // If token estimation throws on a malformed message, fall back to 0 so
           // the sanity check below becomes a no-op instead of crashing compaction.
         }
+
+        // ANTHROPIC FIX: Preserve thinking/redacted_thinking blocks from latest assistant message.
+        // Anthropic's API strictly requires these blocks to remain unmodified.
+        const preservedThinkingBlocks = extractThinkingBlocksFromLatestAssistant(session.messages);
+
         const result = await compactWithSafetyTimeout(
           () => session.compact(params.customInstructions),
           compactionTimeoutMs,
@@ -955,6 +1079,9 @@ export async function compactEmbeddedPiSessionDirect(
           sessionKey: params.sessionKey,
           sessionFile: params.sessionFile,
         });
+
+        // ANTHROPIC FIX: Restore preserved thinking blocks to latest assistant message.
+        restoreThinkingBlocksToLatestAssistant(session.messages, preservedThinkingBlocks);
         // Estimate tokens after compaction by summing token estimates for remaining messages
         let tokensAfter: number | undefined;
         try {
@@ -1022,6 +1149,7 @@ export async function compactEmbeddedPiSessionDirect(
                 messageCount: messageCountAfter,
                 tokenCount: tokensAfter,
                 compactedCount,
+                sessionFile: params.sessionFile,
               },
               {
                 sessionId: params.sessionId,
@@ -1056,6 +1184,8 @@ export async function compactEmbeddedPiSessionDirect(
           clearPendingOnTimeout: true,
         });
         session.dispose();
+        await bundleMcpRuntime?.dispose();
+        await bundleLspRuntime?.dispose();
       }
     } finally {
       await sessionLock.release();
@@ -1086,6 +1216,7 @@ export async function compactEmbeddedPiSession(
       ensureRuntimePluginsLoaded({
         config: params.config,
         workspaceDir: params.workspaceDir,
+        allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
       });
       ensureContextEnginesInitialized();
       const contextEngine = await resolveContextEngine(params.config);
