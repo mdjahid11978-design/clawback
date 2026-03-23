@@ -1,4 +1,4 @@
-  #OpenClaw — Personal AI Assistant
+  #Open clow hub — Personal AI Assistant
 
 <p align="center">
     <picture>
